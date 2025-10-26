@@ -11,6 +11,15 @@ from collections import defaultdict
 from .datasets import build_dataset
 from .samplers import build_sampler
 from .transforms import INTERPOLATION_MODES, build_transform
+from torchvision.transforms import InterpolationMode
+
+def _resize_with_alias(size, interpolation):
+    try:
+        return T.Resize(size, interpolation=interpolation, antialias=True)
+    except TypeError:
+        # older torchvision without the antialias kw
+        return T.Resize(size, interpolation=interpolation)
+
 
 
 def build_data_loader(
@@ -252,15 +261,22 @@ class DatasetWrapper(TorchDataset):
 
         # Build transform that doesn't apply any data augmentation
         interp_mode = INTERPOLATION_MODES[cfg.INPUT.INTERPOLATION]
+        # to_tensor = []
+        # to_tensor += [T.Resize(cfg.INPUT.SIZE, interpolation=interp_mode)]
+        # to_tensor += [T.ToTensor()]
+        # if "normalize" in cfg.INPUT.TRANSFORMS:
+        #     normalize = T.Normalize(
+        #         mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD
+        #     )
+        #     to_tensor += [normalize]
+        # self.to_tensor = T.Compose(to_tensor)
         to_tensor = []
-        to_tensor += [T.Resize(cfg.INPUT.SIZE, interpolation=interp_mode)]
+        to_tensor += [_resize_with_alias(cfg.INPUT.SIZE, interpolation=interp_mode)]
         to_tensor += [T.ToTensor()]
         if "normalize" in cfg.INPUT.TRANSFORMS:
-            normalize = T.Normalize(
-                mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD
-            )
-            to_tensor += [normalize]
+            to_tensor += [T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD)]
         self.to_tensor = T.Compose(to_tensor)
+
 
     def __len__(self):
         return len(self.data_source)
@@ -326,15 +342,23 @@ class DatasetCifar100(TorchDataset):
 
         # Build transform that doesn't apply any data augmentation
         interp_mode = INTERPOLATION_MODES[cfg.INPUT.INTERPOLATION]
+        # to_tensor = []
+        # to_tensor += [T.Resize(cfg.INPUT.SIZE, interpolation=interp_mode)]
+        # to_tensor += [T.ToTensor()]
+        # if "normalize" in cfg.INPUT.TRANSFORMS:
+        #     normalize = T.Normalize(
+        #         mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD
+        #     )
+        #     to_tensor += [normalize]
+        # self.to_tensor = T.Compose(to_tensor)
+        
         to_tensor = []
-        to_tensor += [T.Resize(cfg.INPUT.SIZE, interpolation=interp_mode)]
+        to_tensor += [_resize_with_alias(cfg.INPUT.SIZE, interpolation=interp_mode)]
         to_tensor += [T.ToTensor()]
         if "normalize" in cfg.INPUT.TRANSFORMS:
-            normalize = T.Normalize(
-                mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD
-            )
-            to_tensor += [normalize]
+            to_tensor += [T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD)]
         self.to_tensor = T.Compose(to_tensor)
+
 
     def __len__(self):
         return len(self.data_source)
@@ -392,3 +416,4 @@ class DatasetCifar100(TorchDataset):
             img = img[0]
 
         return img
+

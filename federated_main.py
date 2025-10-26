@@ -1,3 +1,12 @@
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="The default value of the antialias parameter",
+    category=UserWarning,
+    module="torchvision.transforms.functional"
+)
+
+
 import argparse
 import torch
 from Dassl.dassl.utils import setup_logger, set_random_seed, collect_env_info
@@ -8,6 +17,48 @@ import time
 import copy
 import numpy as np
 from utils.fed_utils import average_weights, count_parameters
+
+def _normalize_ctx_payload(prompt_learner, payload):
+    """
+    Accepts: dict with 'ctx', raw tensor, list/tuple (possibly nested)
+    Returns: dict with a proper Tensor under 'ctx' on correct device/dtype/shape.
+    """
+    device = prompt_learner.ctx.device
+    dtype  = prompt_learner.ctx.dtype
+    n_ctx  = prompt_learner.n_ctx  # Prompt length
+    # Some repos store ctx as (n_ctx, dim), some as (1, n_ctx, dim). We'll fix below.
+
+    if isinstance(payload, torch.Tensor):
+        ctx = payload.to(device=device, dtype=dtype)
+        pass
+    elif isinstance(payload, dict):
+        ctx = payload.get('ctx', None)
+        if isinstance(ctx, torch.Tensor):
+            ctx = ctx.to(device=device, dtype=dtype)
+        elif isinstance(ctx, (list, tuple)):
+            ctx = torch.tensor(ctx, dtype=dtype, device=device)
+        else:
+            raise TypeError(f"Unsupported ctx type inside dict: {type(ctx)}")
+    elif isinstance(payload, (list, tuple)):
+        ctx = torch.tensor(payload, dtype=dtype, device=device)
+    else:
+        raise TypeError(f"Unsupported payload type: {type(payload)}")
+
+    # Fix shape if flattened or has a batch dim
+    if ctx.dim() == 1:
+        # assume flattened; infer dim from current parameter
+        dim = prompt_learner.ctx.shape[-1]
+        ctx = ctx.view(n_ctx, dim)
+    elif ctx.dim() == 3 and ctx.shape[0] == 1:
+        # e.g., (1, n_ctx, dim) -> (n_ctx, dim)
+        ctx = ctx.squeeze(0)
+    elif ctx.dim() == 2:
+        # good: (n_ctx, dim)
+        pass
+    else:
+        raise ValueError(f"Unexpected ctx shape: {tuple(ctx.shape)}")
+
+    return {'ctx': ctx}
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -401,9 +452,15 @@ def main(args):
                     local_trainer.model.load_state_dict(local_gatings[idx], strict=False)
                     selected_experts = local_trainer.sparse_selection(idx, local_prompts)
                     local_trainer.download_nonlocal_ctx([local_prompts[iii] for iii in selected_experts])
-                    local_trainer.model.load_ctx(local_prompts[idx])
+                    # local_trainer.model.load_ctx(local_prompts[idx])
+                    payload = local_prompts[idx]  # was a list before
+                    payload = _normalize_ctx_payload(local_trainer.model.prompt_learner, payload)
+                    local_trainer.model.load_ctx(payload)
                 elif local_prompts[idx] != []:
-                    local_trainer.model.load_ctx(local_prompts[idx])
+                    # local_trainer.model.load_ctx(local_prompts[idx])
+                    payload = local_prompts[idx]  # was a list before
+                    payload = _normalize_ctx_payload(local_trainer.model.prompt_learner, payload)
+                    local_trainer.model.load_ctx(payload)
                 else:
                     local_trainer.model.load_ctx(global_prompt)
                             

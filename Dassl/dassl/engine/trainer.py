@@ -588,9 +588,13 @@ class TrainerXU(SimpleTrainer):
             batch_time.update(time.time() - end)
             losses.update(loss_summary)
 
-            meet_freq = (self.batch_idx + 1) % self.cfg.TRAIN.PRINT_FREQ == 0
-            only_few_batches = self.num_batches < self.cfg.TRAIN.PRINT_FREQ
-            if meet_freq or only_few_batches:
+            # meet_freq = (self.batch_idx + 1) % self.cfg.TRAIN.PRINT_FREQ == 0
+            # only_few_batches = self.num_batches < self.cfg.TRAIN.PRINT_FREQ
+            # if meet_freq or only_few_batches:
+            
+            # let's just print 2 times per epoch
+            should_print = (self.batch_idx + 1) in (1, self.num_batches)
+            if should_print:
                 nb_remain = 0
                 nb_remain += self.num_batches - self.batch_idx - 1
                 nb_remain += (
@@ -652,9 +656,12 @@ class TrainerX(SimpleTrainer):
             batch_time.update(time.time() - end)
             losses.update(loss_summary)
 
-            meet_freq = (self.batch_idx + 1) % self.cfg.TRAIN.PRINT_FREQ == 0
-            only_few_batches = self.num_batches < self.cfg.TRAIN.PRINT_FREQ
-            if meet_freq or only_few_batches:
+            # meet_freq = (self.batch_idx + 1) % self.cfg.TRAIN.PRINT_FREQ == 0
+            # only_few_batches = self.num_batches < self.cfg.TRAIN.PRINT_FREQ
+            # if meet_freq or only_few_batches:
+            # let's just print 2 times per epoch
+            should_print = (self.batch_idx + 1) in (1, self.num_batches)
+            if should_print:
                 nb_remain = 0
                 nb_remain += self.num_batches - self.batch_idx - 1
                 nb_remain += (
@@ -699,3 +706,4 @@ class TrainerX(SimpleTrainer):
         domain = domain.to(self.device)
 
         return input, label, domain
+

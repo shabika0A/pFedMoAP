@@ -233,12 +233,27 @@ def _build_transform_train(cfg, choices, target_size, normalize):
         print(f"+ random crop (padding = {crop_padding})")
         tfm_train += [RandomCrop(input_size, padding=crop_padding)]
 
+    # if "random_resized_crop" in choices:
+    #     s_ = cfg.INPUT.RRCROP_SCALE
+    #     print(f"+ random resized crop (size={input_size}, scale={s_})")
+    #     tfm_train += [
+    #         RandomResizedCrop(input_size, scale=s_, interpolation=interp_mode)
+    #     ]
     if "random_resized_crop" in choices:
         s_ = cfg.INPUT.RRCROP_SCALE
         print(f"+ random resized crop (size={input_size}, scale={s_})")
-        tfm_train += [
-            RandomResizedCrop(input_size, scale=s_, interpolation=interp_mode)
-        ]
+        try:
+            tfm_train += [
+                RandomResizedCrop(
+                    input_size, scale=s_, interpolation=interp_mode, antialias=True
+                )
+            ]
+        except TypeError:
+            # fallback for older torchvision versions that don't support antialias
+            tfm_train += [
+                RandomResizedCrop(input_size, scale=s_, interpolation=interp_mode)
+            ]
+
 
     if "random_flip" in choices:
         print("+ random flip")
@@ -337,7 +352,11 @@ def _build_transform_test(cfg, choices, target_size, normalize):
     input_size = cfg.INPUT.SIZE
 
     print(f"+ resize the smaller edge to {max(input_size)}")
-    tfm_test += [Resize(max(input_size), interpolation=interp_mode)]
+    # tfm_test += [Resize(max(input_size), interpolation=interp_mode)]
+    try:
+        tfm_test += [Resize(input_size, interpolation=interp_mode, antialias=True)]
+    except TypeError:
+        tfm_test += [Resize(input_size, interpolation=interp_mode)]
 
     print(f"+ {target_size} center crop")
     tfm_test += [CenterCrop(input_size)]
@@ -358,3 +377,4 @@ def _build_transform_test(cfg, choices, target_size, normalize):
     tfm_test = Compose(tfm_test)
 
     return tfm_test
+

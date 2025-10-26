@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from .model import build_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
+from typing import Optional
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -36,7 +37,17 @@ _MODELS = {
 }
 
 
-def _download(url: str, root: str = os.path.expanduser(os.path.join(os.environ["PROJECT"], "VirtualEnvs/.cache/clip"))):
+# def _download(url: str, root: str = os.path.expanduser(os.path.join(os.environ["PROJECT"], "VirtualEnvs/.cache/clip"))):
+
+
+
+def _default_clip_cache() -> str:
+    # ~/.cache/clip (Linux/macOS) or %USERPROFILE%\.cache\clip (Windows)
+    return os.path.join(os.path.expanduser("~"), ".cache", "clip")
+
+def _download(url: str, root: Optional[str] = None):
+    if root is None:
+        root = _default_clip_cache()
     os.makedirs(root, exist_ok=True)
     filename = os.path.basename(url)
 
