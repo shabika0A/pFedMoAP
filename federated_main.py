@@ -115,6 +115,10 @@ def get_args():
     parser.add_argument("--no-train", action="store_true", help="do not call trainer.train()")
     parser.add_argument("opts", default=None, nargs=argparse.REMAINDER, help="modify config options using the command-line")
 
+    # MMR hybrid implementation
+    parser.add_argument('--alpha', type=float, default=0.5, help='Weight for performance score in Hybrid MMR base score.')
+    parser.add_argument('--lambda_mmr', type=float, default=0.7, help='Trade-off parameter lambda in Hybrid MMR.') # Renamed to avoid conflict with python keyword
+    parser.add_argument('--beta_ema', type=float, default=0.9, help='Decay factor for performance EMA.')    
     args = parser.parse_args()
     return args
 
@@ -221,6 +225,10 @@ def extend_cfg(cfg, args):
     cfg.MODEL.BACKBONE.PRETRAINED = True
 
     cfg.TEST.NO_TEST = True
+
+    cfg.TRAINER.PFEDMOAP.ALPHA = args.alpha
+    cfg.TRAINER.PFEDMOAP.LAMBDA_MMR = args.lambda_mmr # Use the renamed arg
+    cfg.TRAINER.PFEDMOAP.BETA_EMA = args.beta_ema
 
 
 def setup_cfg(args):
@@ -418,8 +426,16 @@ def main(args):
                         else:
                             local_trainer.model.load_state_dict(global_weights, strict=False)
                         # experts
-                        selected_experts = local_trainer.sparse_selection(idx, local_prompts)
-                        local_trainer.download_nonlocal_ctx([local_prompts[iii] for iii in selected_experts])
+                        # selected_experts = local_trainer.sparse_selection(idx, local_prompts)
+                        # local_trainer.download_nonlocal_ctx([local_prompts[iii] for iii in selected_experts])
+                        if local_prompts[idx] != [] or epoch > 0: # Ensure prompts exist for selection
+                            # Experts selection using Hybrid MMR
+                            selected_experts_indices = local_trainer.sparse_selection(idx, local_prompts, method="nearest") # or "random"
+                            print(f"Client {idx} selected experts: {selected_experts_indices}") # Optional debug print
+                            if selected_experts_indices: # Check if list is not empty
+                                local_trainer.download_nonlocal_ctx([local_prompts[expert_idx] for expert_idx in selected_experts_indices])
+                            else: # Handle case where no experts are selected
+                                local_trainer.download_nonlocal_ctx([]) # Pass empty list
                     else:
                         # the first time
                         local_trainer.model.load_state_dict(global_weights, strict=False)
@@ -430,6 +446,12 @@ def main(args):
 
                 # test selected clients for this round
                 results[idx] = local_trainer.test(idx=idx)
+
+                if results[idx] is not None:
+                    # Assuming results[idx][0] is accuracy percentage
+                    current_accuracy = results[idx][0] / 100.0
+                    # Call the new method in PFEDMOAP trainer to update EMA
+                    local_trainer.update_perf_ema(idx, current_accuracy, local_prompts)
 
                 # upload
                 local_weight = local_trainer.model.state_dict()
@@ -465,6 +487,7 @@ def main(args):
                     local_trainer.model.load_ctx(global_prompt)
                             
                 results[idx] = local_trainer.test(idx=idx)
+            
             evaluate_trainer(results, mode=args.model)
             print("Round on server :", epoch)
 

@@ -21,8 +21,14 @@ from Dassl.dassl.utils import count_num_param, load_checkpoint, load_pretrained_
 from trainers.promptfl import TextEncoder, load_clip_to_cpu
 
 import random
+import torch.nn.functional as F
 
 _tokenizer = _Tokenizer()
+
+def cosine_similarity(vec1, vec2):
+    vec1 = vec1.flatten()
+    vec2 = vec2.flatten()
+    return F.cosine_similarity(vec1, vec2, dim=0)
 
 class PromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
@@ -78,6 +84,11 @@ class PromptLearner(nn.Module):
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
         self.class_token_position = cfg.TRAINER.PFEDMOAP.CLASS_TOKEN_POSITION
+
+        self.perf_ema = {i: {} for i in range(cfg.DATASET.USERS)} # Dict[client_id][expert_id] -> ema_score
+        self.beta_ema = cfg.TRAINER.PFEDMOAP.BETA_EMA
+        self.alpha = cfg.TRAINER.PFEDMOAP.ALPHA
+        self.lambda_mmr = cfg.TRAINER.PFEDMOAP.LAMBDA_MMR
 
     def forward(self):
         ctx = self.ctx
@@ -318,43 +329,109 @@ class PFEDMOAP(TrainerX):
             return self.distance_cache[x][idx]
         return None
 
-    def sparse_selection(self, idx, ctxs, method="random"):
-        def random_selection(idx, ctxs):
-            selected_indices = []
-            for x in self.shuffled_all_indices:
-                if self.random_selection_condition(x, idx, ctxs):
-                    selected_indices.append(x)
-                if len(selected_indices) == self.num_experts - 1: # exclude the current client
-                    break
+    # Replace the existing sparse_selection method in PFEDMOAP class
+
+    def sparse_selection(self, client_id, all_prompts_ctx):
+        """Selects top-K non-local experts using Hybrid MMR."""
+        K = self.num_experts - 1 # We need K non-local experts
+        if K <= 0:
+            self.last_selected_experts[client_id] = []
+            return []
+
+        # --- Get client's current prompt vector ---
+        # Ensure client has a prompt, otherwise maybe return random or default?
+        if all_prompts_ctx[client_id] == []: 
+            print(f"Warning: Client {client_id} has no prompt yet. Returning random experts.")
+            # Fallback logic (e.g., random selection)
+            candidate_indices = [i for i, ctx in enumerate(all_prompts_ctx) if ctx != [] and i != client_id]
+            if len(candidate_indices) <= K:
+                selected_indices = candidate_indices
+            else:
+                selected_indices = random.sample(candidate_indices, K)
+            self.last_selected_experts[client_id] = selected_indices
             return selected_indices
-        
-        if method == "random":
-            return random_selection(idx, ctxs)
-        
 
-        if method == "nearest":
-            if ctxs[idx] == []:
-                return random_selection(idx, ctxs)
-            trained_indices = [i for i in range(len(ctxs)) if ctxs[i] != []]
-            if len(trained_indices) <= self.num_experts:
-                return [i for i in trained_indices if i != idx]
-                
-            distances = []
-            for a_trained_idx in trained_indices:
-                if a_trained_idx == idx:
-                    continue
-                dist = self._get_dist_from_cache(idx, a_trained_idx)
-                if dist is None:
-                    dist = torch.norm(ctxs[idx] - ctxs[a_trained_idx])
-                    self.distance_cache[idx][a_trained_idx] = dist
-                    self.distance_cache[a_trained_idx][idx] = dist
-                distances.append(dist)
-            indices_for_smallest_dist = torch.topk(distances, self.num_experts-1, largest=False)[1]
-            return [int(i.item()) for i in indices_for_smallest_dist]
+        client_vec = all_prompts_ctx[client_id].to(self.device).float() # Use the client's own prompt
 
-            # raise NotImplementedError(f"Method: {method} has not been implemented yet")
-        raise ValueError(f"Unknown sparse selection method for experts: {method}")
+        # --- Identify candidate experts (trained, non-local) ---
+        candidate_experts = [] # List of tuples: (expert_id, expert_vec)
+        candidate_indices_map = {} # Map subset index back to original index
+        original_indices = []
+        current_candidate_idx = 0
+        for i, ctx in enumerate(all_prompts_ctx):
+            if ctx != [] and i != client_id:
+                candidate_experts.append((i, ctx.to(self.device).float()))
+                candidate_indices_map[current_candidate_idx] = i
+                original_indices.append(i)
+                current_candidate_idx += 1
 
+        if not candidate_experts:
+            self.last_selected_experts[client_id] = []
+            return [] # No candidates available
+
+        num_candidates = len(candidate_experts)
+
+        # --- Pre-compute Base Scores ---
+        base_scores = torch.zeros(num_candidates, device=self.device)
+        similarities_to_client = torch.zeros(num_candidates, device=self.device)
+
+        for i in range(num_candidates):
+            expert_id, e_vec = candidate_experts[i]
+            sim_client_e = cosine_similarity(client_vec, e_vec)
+            similarities_to_client[i] = sim_client_e
+
+            # Get performance EMA score - Default to 0 if not available
+            perf_e = self.perf_ema.get(client_id, {}).get(expert_id, 0.0) 
+
+            base_scores[i] = sim_client_e * (1 + self.alpha * perf_e)
+
+        # --- Start Greedy MMR Selection ---
+        selected_indices_subset = [] # Indices within the candidate_experts list
+        selected_expert_vectors = [] 
+
+        remaining_indices = list(range(num_candidates))
+
+        while len(selected_indices_subset) < K and len(remaining_indices) > 0:
+            best_score = -float('inf')
+            best_idx_in_remaining = -1
+
+            for current_subset_idx_pos, current_subset_idx in enumerate(remaining_indices):
+                expert_id, e_vec = candidate_experts[current_subset_idx]
+
+                # 1. Base score (pre-computed)
+                base_e = base_scores[current_subset_idx]
+
+                # 2. Redundancy penalty red(e, S)
+                if not selected_indices_subset:
+                    red_e_S = 0.0
+                else:
+                    redundancy_scores = [cosine_similarity(e_vec, s_vec) for s_vec in selected_expert_vectors]
+                    red_e_S = torch.max(torch.tensor(redundancy_scores, device=self.device)) if redundancy_scores else 0.0
+
+                # 3. Adjusted MMR score
+                adjusted_e = (self.lambda_mmr * base_e) - ((1 - self.lambda_mmr) * red_e_S)
+
+                if adjusted_e > best_score:
+                    best_score = adjusted_e
+                    best_idx_in_remaining = current_subset_idx_pos # Store position in remaining_indices
+                    best_original_subset_idx = current_subset_idx # Store the actual index in candidate_experts
+
+            if best_idx_in_remaining != -1:
+                # Add the best expert to the selected set
+                selected_indices_subset.append(best_original_subset_idx)
+                selected_expert_vectors.append(candidate_experts[best_original_subset_idx][1])
+                # Remove from remaining candidates
+                del remaining_indices[best_idx_in_remaining]
+            else:
+                break # Should not happen if candidates exist, but safety break
+
+        # --- Map selected subset indices back to original expert indices ---
+        final_selected_original_indices = [candidate_indices_map[i] for i in selected_indices_subset]
+
+        # Store the selected indices for EMA update
+        self.last_selected_experts[client_id] = final_selected_original_indices
+
+        return final_selected_original_indices 
     
     def forward_backward(self, batch, global_weight=None, fedprox=False, mu=0.5):
         image, label = self.parse_batch_train(batch)
@@ -424,6 +501,26 @@ class PFEDMOAP(TrainerX):
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
+    # Add this method inside the PFEDMOAP class
+    def update_perf_ema(self, client_id, current_accuracy, all_prompts):
+        """Updates the performance EMA for the client and the experts it used."""
+        if not self.model.nonlocal_ctx: # Only local expert was used
+            expert_indices = [client_id]
+        else:
+            # Need to figure out the original indices of the selected nonlocal experts
+            # This depends on how selected_experts indices are determined in sparse_selection
+            # Assuming selected_experts contains the *original* indices:
+            selected_experts_indices = self.last_selected_experts.get(client_id, []) # Need to store this during selection
+            expert_indices = [client_id] + selected_experts_indices
+
+        for expert_id in expert_indices:
+            if expert_id not in self.perf_ema[client_id]:
+                self.perf_ema[client_id][expert_id] = current_accuracy # Initialize if first time
+            else:
+                old_ema = self.perf_ema[client_id][expert_id]
+                new_ema = (self.beta_ema * old_ema) + ((1 - self.beta_ema) * current_accuracy)
+                self.perf_ema[client_id][expert_id] = new_ema
+        # print(f"Updated EMA for client {client_id}, experts {expert_indices}: { {eid: self.perf_ema[client_id][eid] for eid in expert_indices} }") # Optional: for debugging
 
 
 class MultiheadAttention(nn.Module):

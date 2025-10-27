@@ -63,7 +63,10 @@ python federated_main.py \
     --num_experts ${NUM_EXPERTS} \
     --sparse_selection ${SPARSE_SELECTION} \
     --scaling ${SCALING} \
-    --seed ${SEED}
+    --seed ${SEED} \
+    --alpha 0.5 \
+    --lambda_mmr 0.7 \
+    --beta_ema 0.9 \
 
 # done
 
