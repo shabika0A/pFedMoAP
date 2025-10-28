@@ -85,10 +85,6 @@ class PromptLearner(nn.Module):
         self.name_lens = name_lens
         self.class_token_position = cfg.TRAINER.PFEDMOAP.CLASS_TOKEN_POSITION
 
-        self.perf_ema = {i: {} for i in range(cfg.DATASET.USERS)} # Dict[client_id][expert_id] -> ema_score
-        self.beta_ema = cfg.TRAINER.PFEDMOAP.BETA_EMA
-        self.alpha = cfg.TRAINER.PFEDMOAP.ALPHA
-        self.lambda_mmr = cfg.TRAINER.PFEDMOAP.LAMBDA_MMR
 
     def forward(self):
         ctx = self.ctx
@@ -302,6 +298,12 @@ class PFEDMOAP(TrainerX):
         if device_count > 1:
             print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
             # self.model = nn.DataParallel(self.model, device_ids=[1])
+
+        self.perf_ema = {i: {} for i in range(cfg.DATASET.USERS)} # Dict[client_id][expert_id] -> ema_score
+        self.beta_ema = cfg.TRAINER.PFEDMOAP.BETA_EMA
+        self.alpha = cfg.TRAINER.PFEDMOAP.ALPHA
+        self.lambda_mmr = cfg.TRAINER.PFEDMOAP.LAMBDA_MMR
+        self.last_selected_experts = {} # Keep track of last selected experts for EMA update
 
         # for sparse selection
         self.shuffled_all_indices = list(range(cfg.DATASET.USERS))

@@ -21,45 +21,73 @@ from utils.fed_utils import average_weights, count_parameters
 def _normalize_ctx_payload(prompt_learner, payload):
     """
     Accepts: dict with 'ctx', raw tensor, list/tuple (possibly nested)
-    Returns: dict with a proper Tensor under 'ctx' on correct device/dtype/shape.
+    Returns: dict with a proper Tensor under 'ctx' on correct device/dtype/shape,
+             or None if the input payload resolves to an empty tensor/list.
     """
     device = prompt_learner.ctx.device
     dtype  = prompt_learner.ctx.dtype
     n_ctx  = prompt_learner.n_ctx  # Prompt length
-    # Some repos store ctx as (n_ctx, dim), some as (1, n_ctx, dim). We'll fix below.
+    dim = prompt_learner.ctx.shape[-1] # Get dim from the learner
 
+    ctx = None # Initialize ctx
+
+    # --- Extract potential tensor/list from payload ---
     if isinstance(payload, torch.Tensor):
-        ctx = payload.to(device=device, dtype=dtype)
-        pass
+        if payload.numel() > 0: # Check if tensor is not empty
+            ctx = payload.to(device=device, dtype=dtype)
     elif isinstance(payload, dict):
-        ctx = payload.get('ctx', None)
-        if isinstance(ctx, torch.Tensor):
-            ctx = ctx.to(device=device, dtype=dtype)
-        elif isinstance(ctx, (list, tuple)):
-            ctx = torch.tensor(ctx, dtype=dtype, device=device)
-        else:
-            raise TypeError(f"Unsupported ctx type inside dict: {type(ctx)}")
-    elif isinstance(payload, (list, tuple)):
-        ctx = torch.tensor(payload, dtype=dtype, device=device)
-    else:
-        raise TypeError(f"Unsupported payload type: {type(payload)}")
+        ctx_data = payload.get('ctx', None)
+        if isinstance(ctx_data, torch.Tensor):
+            if ctx_data.numel() > 0:
+                 ctx = ctx_data.to(device=device, dtype=dtype)
+        elif isinstance(ctx_data, (list, tuple)) and ctx_data: # Check if list/tuple is not empty
+            try:
+                ctx = torch.tensor(ctx_data, dtype=dtype, device=device)
+                if ctx.numel() == 0: # Double-check tensor creation didn't result in empty
+                    ctx = None
+            except Exception as e:
+                print(f"Error converting list/tuple to tensor in _normalize_ctx_payload: {e}")
+                return None # Return None on conversion error
+        # else: ctx remains None if ctx_data is None, empty list/tuple, or other type
+    elif isinstance(payload, (list, tuple)) and payload: # Check if list/tuple is not empty
+        try:
+            ctx = torch.tensor(payload, dtype=dtype, device=device)
+            if ctx.numel() == 0: # Double-check
+                 ctx = None
+        except Exception as e:
+            print(f"Error converting list/tuple payload to tensor in _normalize_ctx_payload: {e}")
+            return None # Return None on conversion error
+    # else: ctx remains None if payload is None, empty list/tuple, or other type
 
-    # Fix shape if flattened or has a batch dim
-    if ctx.dim() == 1:
-        # assume flattened; infer dim from current parameter
-        dim = prompt_learner.ctx.shape[-1]
-        ctx = ctx.view(n_ctx, dim)
-    elif ctx.dim() == 3 and ctx.shape[0] == 1:
-        # e.g., (1, n_ctx, dim) -> (n_ctx, dim)
-        ctx = ctx.squeeze(0)
-    elif ctx.dim() == 2:
-        # good: (n_ctx, dim)
-        pass
-    else:
-        raise ValueError(f"Unexpected ctx shape: {tuple(ctx.shape)}")
+    # --- If ctx is None after extraction, return None ---
+    if ctx is None:
+        print("Warning: _normalize_ctx_payload received or resulted in empty ctx.")
+        return None
+
+    # --- Reshape if necessary ---
+    try:
+        if ctx.dim() == 1:
+            # assume flattened; infer dim from current parameter
+            ctx = ctx.view(n_ctx, dim)
+        elif ctx.dim() == 3 and ctx.shape[0] == 1:
+            # e.g., (1, n_ctx, dim) -> (n_ctx, dim)
+            ctx = ctx.squeeze(0)
+        elif ctx.dim() == 2:
+            # good: (n_ctx, dim)
+            pass
+        else:
+             # If shape is already wrong but tensor not empty, raise error here
+            raise ValueError(f"Unexpected ctx shape after extraction: {tuple(ctx.shape)}")
+
+        # Final shape check
+        if ctx.shape != (n_ctx, dim):
+             raise ValueError(f"Final ctx shape {tuple(ctx.shape)} does not match expected ({n_ctx}, {dim})")
+
+    except Exception as e:
+        print(f"Error during reshaping in _normalize_ctx_payload: {e}. Ctx shape was {tuple(ctx.shape) if ctx is not None else 'None'}")
+        return None # Return None if reshaping fails
 
     return {'ctx': ctx}
-
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="pFedMoAP", help="model of aggregation, choose from: pFedMoAP (used with pFedMoAP), fedavg, fedprox, local(The last three are used with PromptFL)")
@@ -430,7 +458,7 @@ def main(args):
                         # local_trainer.download_nonlocal_ctx([local_prompts[iii] for iii in selected_experts])
                         if local_prompts[idx] != [] or epoch > 0: # Ensure prompts exist for selection
                             # Experts selection using Hybrid MMR
-                            selected_experts_indices = local_trainer.sparse_selection(idx, local_prompts, method="nearest") # or "random"
+                            selected_experts_indices = local_trainer.sparse_selection(idx, local_prompts)
                             print(f"Client {idx} selected experts: {selected_experts_indices}") # Optional debug print
                             if selected_experts_indices: # Check if list is not empty
                                 local_trainer.download_nonlocal_ctx([local_prompts[expert_idx] for expert_idx in selected_experts_indices])
@@ -470,24 +498,60 @@ def main(args):
             for idx in all_users:
                 if results[idx] is not None:
                     continue
-                if local_gatings[idx] != []:
+
+                # --- Start modification ---
+                payload_dict = None # Initialize payload_dict for this client iteration
+
+                if local_gatings[idx] != []: # Client has trained AND has a gating network state
                     local_trainer.model.load_state_dict(local_gatings[idx], strict=False)
                     selected_experts = local_trainer.sparse_selection(idx, local_prompts)
-                    local_trainer.download_nonlocal_ctx([local_prompts[iii] for iii in selected_experts])
-                    # local_trainer.model.load_ctx(local_prompts[idx])
-                    payload = local_prompts[idx]  # was a list before
-                    payload = _normalize_ctx_payload(local_trainer.model.prompt_learner, payload)
-                    local_trainer.model.load_ctx(payload)
-                elif local_prompts[idx] != []:
-                    # local_trainer.model.load_ctx(local_prompts[idx])
-                    payload = local_prompts[idx]  # was a list before
-                    payload = _normalize_ctx_payload(local_trainer.model.prompt_learner, payload)
-                    local_trainer.model.load_ctx(payload)
-                else:
-                    local_trainer.model.load_ctx(global_prompt)
-                            
-                results[idx] = local_trainer.test(idx=idx)
-            
+                    if selected_experts:
+                        local_trainer.download_nonlocal_ctx([local_prompts[iii] for iii in selected_experts])
+                    else:
+                        local_trainer.download_nonlocal_ctx([])
+
+                    payload = local_prompts[idx]
+                    payload_dict = _normalize_ctx_payload(local_trainer.model.prompt_learner, payload)
+
+                    # ===> ADD Check here <===
+                    if payload_dict is not None:
+                        local_trainer.model.load_ctx(payload_dict['ctx'])
+                        results[idx] = local_trainer.test(idx=idx)
+                    else:
+                        print(f"Skipping test for trained client {idx}: prompt normalization failed.")
+                        results[idx] = [0.0, 100.0, 0.0] # Assign default bad results
+
+                elif local_prompts[idx] != []: # Client has trained but might not have gating state
+                    payload = local_prompts[idx]
+                    payload_dict = _normalize_ctx_payload(local_trainer.model.prompt_learner, payload)
+
+                    # ===> ADD Check here <===
+                    if payload_dict is not None:
+                        local_trainer.model.load_ctx(payload_dict['ctx'])
+                        local_trainer.download_nonlocal_ctx([])
+                        results[idx] = local_trainer.test(idx=idx)
+                    else:
+                        print(f"Skipping test for trained client {idx}: prompt normalization failed.")
+                        results[idx] = [0.0, 100.0, 0.0] # Assign default bad results
+
+                else: # Client has NOT trained yet
+                    if global_prompt is not None: # Make sure global_prompt exists
+                        payload = global_prompt
+                        # Try to normalize the global prompt
+                        payload_dict = _normalize_ctx_payload(local_trainer.model.prompt_learner, payload)
+
+                    # Check if payload_dict is valid (covers None global_prompt AND normalization failure)
+                    if payload_dict is not None:
+                        local_trainer.model.load_ctx(payload_dict['ctx'])
+                        local_trainer.download_nonlocal_ctx([])
+                        # Test ONLY if global_prompt was loaded and normalized correctly
+                        results[idx] = local_trainer.test(idx=idx)
+                    else:
+                        # Skip test if global_prompt is None OR if normalization failed
+                        print(f"Skipping test for untrained client {idx}: global_prompt unavailable or invalid.")
+                        results[idx] = [0.0, 100.0, 0.0] # Assign default bad results
+
+                # --- End modification ---
             evaluate_trainer(results, mode=args.model)
             print("Round on server :", epoch)
 
