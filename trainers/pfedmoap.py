@@ -336,6 +336,10 @@ class PFEDMOAP(TrainerX):
     def sparse_selection(self, client_id, all_prompts_ctx):
         """Selects top-K non-local experts using Hybrid MMR."""
         K = self.num_experts - 1 # We need K non-local experts
+
+        # >>> ADD: print K for visibility
+        print(f"[MMR] client={client_id} | K={K}")
+
         if K <= 0:
             self.last_selected_experts[client_id] = []
             return []
@@ -346,11 +350,17 @@ class PFEDMOAP(TrainerX):
             print(f"Warning: Client {client_id} has no prompt yet. Returning random experts.")
             # Fallback logic (e.g., random selection)
             candidate_indices = [i for i, ctx in enumerate(all_prompts_ctx) if ctx != [] and i != client_id]
+            
+            # >>> ADD: print candidate count in the fallback
+            print(f"[MMR] client={client_id} | candidates={len(candidate_indices)} (fallback)")
+            
             if len(candidate_indices) <= K:
                 selected_indices = candidate_indices
             else:
                 selected_indices = random.sample(candidate_indices, K)
             self.last_selected_experts[client_id] = selected_indices
+            # >>> ADD: print selected set
+            print(f"[MMR] client={client_id} | selected={selected_indices}")
             return selected_indices
 
         client_vec = all_prompts_ctx[client_id].to(self.device).float() # Use the client's own prompt
@@ -372,6 +382,9 @@ class PFEDMOAP(TrainerX):
             return [] # No candidates available
 
         num_candidates = len(candidate_experts)
+
+        # >>> ADD: print number of candidates
+        print(f"[MMR] client={client_id} | K={K} | candidates={num_candidates}")
 
         # --- Pre-compute Base Scores ---
         base_scores = torch.zeros(num_candidates, device=self.device)
@@ -432,6 +445,8 @@ class PFEDMOAP(TrainerX):
 
         # Store the selected indices for EMA update
         self.last_selected_experts[client_id] = final_selected_original_indices
+
+        print(f"[MMR] client={client_id} | selected={final_selected_original_indices}")
 
         return final_selected_original_indices 
     
