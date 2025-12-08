@@ -9,6 +9,7 @@ warnings.filterwarnings(
 
 import argparse
 import torch
+import os
 from Dassl.dassl.utils import setup_logger, set_random_seed, collect_env_info
 from Dassl.dassl.config import get_cfg_default
 from Dassl.dassl.engine import build_trainer
@@ -16,6 +17,7 @@ import time
 
 import copy
 import numpy as np
+from sklearn.metrics import confusion_matrix
 from utils.fed_utils import average_weights, count_parameters
 
 def _normalize_ctx_payload(prompt_learner, payload):
@@ -27,7 +29,14 @@ def _normalize_ctx_payload(prompt_learner, payload):
     device = prompt_learner.ctx.device
     dtype  = prompt_learner.ctx.dtype
     n_ctx  = prompt_learner.n_ctx  # Prompt length
-    dim = prompt_learner.ctx.shape[-1] # Get dim from the learner
+    
+    # Handle case where prompt_learner.ctx might not be initialized yet
+    try:
+        dim = prompt_learner.ctx.shape[-1] # Get dim from the learner
+    except AttributeError:
+        # Fallback or error if ctx is not a tensor (e.g., None)
+        print("Error: prompt_learner.ctx is not initialized or not a tensor.")
+        return None
 
     ctx = None # Initialize ctx
 
@@ -66,21 +75,18 @@ def _normalize_ctx_payload(prompt_learner, payload):
 
     # --- Reshape if necessary ---
     try:
-        if ctx.dim() == 1:
+        expected_shape = (n_ctx, dim)
+        if ctx.shape == expected_shape:
+             pass # Shape is already correct
+        elif ctx.dim() == 1:
             # assume flattened; infer dim from current parameter
             ctx = ctx.view(n_ctx, dim)
         elif ctx.dim() == 3 and ctx.shape[0] == 1:
             # e.g., (1, n_ctx, dim) -> (n_ctx, dim)
             ctx = ctx.squeeze(0)
-        elif ctx.dim() == 2:
-            # good: (n_ctx, dim)
-            pass
-        else:
-             # If shape is already wrong but tensor not empty, raise error here
-            raise ValueError(f"Unexpected ctx shape after extraction: {tuple(ctx.shape)}")
-
+        
         # Final shape check
-        if ctx.shape != (n_ctx, dim):
+        if ctx.shape != expected_shape:
              raise ValueError(f"Final ctx shape {tuple(ctx.shape)} does not match expected ({n_ctx}, {dim})")
 
     except Exception as e:
@@ -88,6 +94,7 @@ def _normalize_ctx_payload(prompt_learner, payload):
         return None # Return None if reshaping fails
 
     return {'ctx': ctx}
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="pFedMoAP", help="model of aggregation, choose from: pFedMoAP (used with pFedMoAP), fedavg, fedprox, local(The last three are used with PromptFL)")
@@ -143,10 +150,6 @@ def get_args():
     parser.add_argument("--no-train", action="store_true", help="do not call trainer.train()")
     parser.add_argument("opts", default=None, nargs=argparse.REMAINDER, help="modify config options using the command-line")
 
-    # MMR hybrid implementation
-    parser.add_argument('--alpha', type=float, default=0.5, help='Weight for performance score in Hybrid MMR base score.')
-    parser.add_argument('--lambda_mmr', type=float, default=0.7, help='Trade-off parameter lambda in Hybrid MMR.') # Renamed to avoid conflict with python keyword
-    parser.add_argument('--beta_ema', type=float, default=0.9, help='Decay factor for performance EMA.')    
     args = parser.parse_args()
     return args
 
@@ -200,13 +203,6 @@ def reset_cfg(cfg, args):
 def extend_cfg(cfg, args):
     """
     Add new config variables.
-
-    E.g.
-        from yacs.config import CfgNode as CN
-        cfg.TRAINER.MY_MODEL = CN()
-        cfg.TRAINER.MY_MODEL.PARAM_A = 1.
-        cfg.TRAINER.MY_MODEL.PARAM_B = 0.5
-        cfg.TRAINER.MY_MODEL.PARAM_C = False
     """
     from yacs.config import CfgNode as CN
 
@@ -254,9 +250,6 @@ def extend_cfg(cfg, args):
 
     cfg.TEST.NO_TEST = True
 
-    cfg.TRAINER.PFEDMOAP.ALPHA = args.alpha
-    cfg.TRAINER.PFEDMOAP.LAMBDA_MMR = args.lambda_mmr # Use the renamed arg
-    cfg.TRAINER.PFEDMOAP.BETA_EMA = args.beta_ema
 
 
 def setup_cfg(args):
@@ -280,6 +273,11 @@ def setup_cfg(args):
 
     # 4. From optional input arguments
     cfg.merge_from_list(args.opts)
+    
+    # --- NEW: Ensure CHECKPOINT_FREQ is set from opts ---
+    if "TRAIN.CHECKPOINT_FREQ" in args.opts:
+        cfg.TRAIN.CHECKPOINT_FREQ = int(args.opts[args.opts.index("TRAIN.CHECKPOINT_FREQ") + 1])
+
 
     cfg.freeze()
 
@@ -303,7 +301,11 @@ def main(args):
     local_prompts = [[] for i in range(args.num_users)]
     global_prompt = None
 
+    # local_trainer = build_trainer(cfg)
     local_trainer = build_trainer(cfg)
+    if torch.cuda.device_count() > 1:
+        print(f"🔁 Using DataParallel on {torch.cuda.device_count()} GPUs")
+        local_trainer.model = torch.nn.DataParallel(local_trainer.model)
     local_trainer.fed_before_train()
     count_parameters(local_trainer.model,"prompt_learner")
     count_parameters(local_trainer.model, "image_encoder")
@@ -329,6 +331,33 @@ def main(args):
     global_time_list = []
     start = time.time()
 
+    # --- LOAD CHECKPOINT LOGIC ---
+    if cfg.RESUME:
+        checkpoint_path = os.path.join(cfg.RESUME, 'checkpoint_latest.pth.tar')
+        if os.path.exists(checkpoint_path):
+            print(f"Loading checkpoint from {checkpoint_path}")
+            try:
+                # --- FIX: ADD weights_only=False ---
+                checkpoint = torch.load(checkpoint_path, weights_only=False) 
+                
+                start_epoch = checkpoint['epoch'] + 1
+                local_prompts = checkpoint['local_prompts']
+                local_gatings = checkpoint['local_gatings']
+                global_prompt = checkpoint['global_prompt']
+                global_test_acc_list = checkpoint.get('global_test_acc_list', [])
+                global_test_error_list = checkpoint.get('global_test_error_list', [])
+                global_test_f1_list = checkpoint.get('global_test_f1_list', [])
+                global_epoch_list = checkpoint.get('global_epoch_list', [])
+                global_time_list = checkpoint.get('global_time_list', [])
+                start = time.time() - global_time_list[-1] if global_time_list else time.time()
+                print(f"Resuming training from round {start_epoch}")
+            except Exception as e:
+                print(f"Error loading checkpoint: {e}. Starting from scratch.")
+                start_epoch = 0
+        else:
+            print(f"Warning: --resume specified but checkpoint_latest.pth.tar not found in {cfg.RESUME}. Starting from scratch.")
+    # --- END NEW LOGIC ---
+
     def evaluate_trainer(results, mode="CLIP"):
         nonlocal global_time_list, global_test_acc_list, global_test_error_list, global_test_f1_list, global_epoch_list
         nonlocal start, max_epoch
@@ -342,18 +371,37 @@ def main(args):
         global_test_acc = []
         global_test_error = []
         global_test_f1 = []
+        # --- FIX: Ensure results[k] is not None before indexing ---
         for k in range(len(results)):
-            global_test_acc.append(results[k][0])
-            global_test_error.append(results[k][1])
-            global_test_f1.append(results[k][2])
+            if results[k] is not None and len(results[k]) >= 3:
+                global_test_acc.append(results[k][0])
+                global_test_error.append(results[k][1])
+                global_test_f1.append(results[k][2])
+            else:
+                # Handle cases where a client might not have results (e.g., skipped test)
+                print(f"Warning: No valid results for client {k} in evaluate_trainer.")
+                
+        # --- FIX: Avoid division by zero if no clients had results ---
+        if not global_test_acc:
+            print("Warning: No client results to evaluate.")
+            avg_acc = 0.0
+            avg_error = 100.0
+            avg_f1 = 0.0
+        else:
+            avg_acc = sum(global_test_acc) / len(global_test_acc)
+            avg_error = sum(global_test_error) / len(global_test_error)
+            avg_f1 = sum(global_test_f1) / len(global_test_f1)
+
         global_time_list.append(time.time() - start)
-        global_test_acc_list.append(sum(global_test_acc)/len(global_test_acc))
-        global_test_error_list.append(sum(global_test_error) / len(global_test_error))
-        global_test_f1_list.append(sum(global_test_f1) / len(global_test_f1))
+        global_test_acc_list.append(avg_acc)
+        global_test_error_list.append(avg_error)
+        global_test_f1_list.append(avg_f1)
         global_epoch_list.append(epoch)
-        print("Global test acc:", sum(global_test_acc)/len(global_test_acc))
-        print("Global test error:", sum(global_test_error) / len(global_test_error))
-        print("Global test macro_f1:", sum(global_test_f1) / len(global_test_f1))
+        
+        print(f"Global test acc: {avg_acc}")
+        print(f"Global test error: {avg_error}")
+        print(f"Global test macro_f1: {avg_f1}")
+
         if (cfg.DATASET.NAME == "DomainNet" or cfg.DATASET.NAME == "Office") and condition and args.split_client:
             domains = {"DomainNet":["clipart", "infograph", "painting", "quickdraw", "real", "sketch"],
                        "Office":["amazon", "caltech", "dslr", "webcam"]}
@@ -362,9 +410,101 @@ def main(args):
             print("Test acc of clients:", global_test_acc)
             for i in range(num_domains):
                 accs = global_test_acc[i*num_clients_per_domain:(i+1)*num_clients_per_domain]
-                print("Test acc of", domains[cfg.DATASET.NAME][i], np.mean(accs), "±", np.std(accs))
-            print("Test acc of all",np.mean(global_test_acc),np.std(global_test_acc))
+                if accs: # Avoid errors on empty lists
+                    print("Test acc of", domains[cfg.DATASET.NAME][i], np.mean(accs), "±", np.std(accs))
+            if global_test_acc: # Avoid errors on empty lists
+                print("Test acc of all",np.mean(global_test_acc),np.std(global_test_acc))
         print("------------local test finish-------------")
+
+    # # --- NEW: FILTER TEST SET TO MATCH TRAIN CLASSES ---
+    # print("\n--- FIXING PARTITION: Filtering Test Sets to match Train Classes ---")
+    # try:
+    #     for client_idx in range(cfg.DATASET.USERS):
+    #         # 1. Identify Train Classes
+    #         train_loader = local_trainer.fed_train_loader_x_dict[client_idx]
+    #         train_labels = []
+    #         for batch in train_loader:
+    #              if isinstance(batch, dict) and "label" in batch:
+    #                  train_labels.extend(batch["label"].tolist())
+    #              else:
+    #                  train_labels.extend(batch[1].tolist())
+    #         valid_classes = set(train_labels)
+
+    #         # 2. Filter Test Dataset
+    #         test_loader = local_trainer.fed_test_loader_x_dict[client_idx]
+    #         dataset = test_loader.dataset
+            
+    #         if hasattr(dataset, 'data_source'):
+    #             original_count = len(dataset.data_source)
+    #             # Filter the list (datum.label or item.label)
+    #             new_data_source = []
+    #             for item in dataset.data_source:
+    #                 # Check label attribute (Datum object) or use item if it's simple
+    #                 label = item.label if hasattr(item, 'label') else item
+    #                 # Only keep if in valid classes
+    #                 if label in valid_classes:
+    #                     new_data_source.append(item)
+                
+    #             # Apply filter
+    #             dataset.data_source = new_data_source
+    #             new_count = len(dataset.data_source)
+                
+    #             if original_count != new_count:
+    #                 print(f"Client {client_idx}: Removed {original_count - new_count} unseen test samples (Now {new_count}).")
+    #         else:
+    #             pass # No data_source to filter
+    # except Exception as e:
+    #     print(f"Partition fix failed: {e}")
+    # print("--------------------------------------------------------------------\n")
+    # # --- END FIX ---
+
+    # # --- SANITY CHECK FOR TRAIN/TEST CLASSES (ALL CLIENTS) ---
+    # print("\n--- STARTING SANITY CHECK: Data Distribution for ALL Clients ---")
+    # clients_with_issues = []
+    # try:
+    #     # Iterate over all clients
+    #     for check_client in range(cfg.DATASET.USERS):
+    #         train_loader = local_trainer.fed_train_loader_x_dict[check_client]
+    #         test_loader = local_trainer.fed_test_loader_x_dict[check_client]
+
+    #         train_labels = []
+    #         for batch in train_loader:
+    #             if isinstance(batch, dict) and "label" in batch:
+    #                 train_labels.extend(batch["label"].tolist())
+    #             else:
+    #                 # Fallback for standard torch loaders, assume tuple (img, label)
+    #                 train_labels.extend(batch[1].tolist())
+
+    #         test_labels = []
+    #         for batch in test_loader:
+    #             if isinstance(batch, dict) and "label" in batch:
+    #                 test_labels.extend(batch["label"].tolist())
+    #             else:
+    #                 test_labels.extend(batch[1].tolist())
+
+    #         train_classes = set(train_labels)
+    #         test_classes = set(test_labels)
+            
+    #         # Check for classes in Test that are NOT in Train
+    #         unseen = test_classes - train_classes
+            
+    #         if unseen:
+    #             print(f"⚠️ Client {check_client}: Has {len(unseen)} UNSEEN test classes: {sorted(list(unseen))}")
+    #             clients_with_issues.append(check_client)
+            
+    #         # Optional: Print progress every 10 clients to show it's working
+    #         if check_client % 10 == 0:
+    #             print(f"Checked Client {check_client}...")
+
+    #     if not clients_with_issues:
+    #         print("✅ SANITY CHECK PASSED: All clients are tested ONLY on classes present in their training set.")
+    #     else:
+    #         print(f"❌ SANITY CHECK FAILED: {len(clients_with_issues)} clients have data leakage/mismatch.")
+
+    # except Exception as e:
+    #     print(f"Sanity Check crashed: {e}")
+    # print("------------------------------------------------------------\n")
+    # # --- END SANITY CHECK ---
 
     for epoch in range(start_epoch, max_epoch):
 
@@ -372,11 +512,10 @@ def main(args):
             print("------------local test start-------------")
             results = []
             idxs_users = list(range(0, cfg.DATASET.USERS))
-            # m = max(int(args.frac * args.num_users), 1)
-            # idxs_users = np.random.choice(range(args.num_users), m, replace=False)
             local_trainer.model.load_state_dict(global_weights)
             for idx in idxs_users:
-                results.append(local_trainer.test(idx=idx))
+                # --- CHANGE: Pass new args ---
+                results.append(local_trainer.test(idx=idx, epoch=epoch, output_dir=cfg.OUTPUT_DIR))
             evaluate_trainer(results, mode=args.trainer)
             print("Round on server :", epoch)
             break
@@ -384,7 +523,6 @@ def main(args):
         elif args.model == "fedavg":
             m = max(int(args.frac * args.num_users), 1)
             idxs_users = np.random.choice(range(args.num_users), m, replace=False)
-            # idxs_users = list(range(0, cfg.DATASET.USERS))
             print("idxs_users", idxs_users)
             print("------------local train start epoch:", epoch, "-------------")
             for idx in idxs_users:
@@ -400,16 +538,16 @@ def main(args):
             results = []
             all_users = list(range(0, cfg.DATASET.USERS))
             local_trainer.model.load_state_dict(global_weights, strict=False)
-            local_weights = [[] for i in range(args.num_users)] # release gpu memory
+            local_weights = [[] for i in range(args.num_users)] 
             for idx in all_users:
-                results.append(local_trainer.test(idx=idx))
+                # --- CHANGE: Pass new args ---
+                results.append(local_trainer.test(idx=idx, epoch=epoch, output_dir=cfg.OUTPUT_DIR))
             evaluate_trainer(results, mode=args.model)
             print("Round on server :", epoch)
 
         elif args.model == "fedprox":
             m = max(int(args.frac * args.num_users), 1)
             idxs_users = np.random.choice(range(args.num_users), m, replace=False)
-            # idxs_users = list(range(0, cfg.DATASET.USERS))
             print("idxs_users", idxs_users)
             print("------------local train start epoch:", epoch, "-------------")
             for idx in idxs_users:
@@ -425,67 +563,79 @@ def main(args):
             results = []
             all_users = list(range(0, cfg.DATASET.USERS))
             local_trainer.model.load_state_dict(global_weights, strict=False)
-            local_weights = [[] for i in range(args.num_users)] # release gpu memory
+            local_weights = [[] for i in range(args.num_users)] 
             for idx in all_users:
-                results.append(local_trainer.test(idx=idx))
+                # --- CHANGE: Pass new args ---
+                results.append(local_trainer.test(idx=idx, epoch=epoch, output_dir=cfg.OUTPUT_DIR))
             evaluate_trainer(results, mode=args.model)
             print("Round on server :", epoch)
 
         elif args.model == "pFedMoAP":
             num_client_selected = int(args.frac * args.num_users)
-            # assert num_client_selected >= args.num_experts, "Do not support less selected clients per round than number of experts!"
             m = max(num_client_selected, 1)
             idxs_users = np.random.choice(range(args.num_users), m, replace=False)
+            
             results = [None for _ in range(cfg.DATASET.USERS)]
+            all_client_preds_lists = [None] * cfg.DATASET.USERS
+            all_client_labels_lists = [None] * cfg.DATASET.USERS
+
             all_users = list(range(0, cfg.DATASET.USERS))
             print("idxs_users", idxs_users)
             print("------------local train start epoch:", epoch, "-------------")
 
             for idx in idxs_users:
                 # download
-                if epoch == 0:
+                if epoch == 0 and global_prompt is None: 
                     local_trainer.model.load_state_dict(global_weights, strict=False)
                 else:
-                    # ensuring training only the local prompts (no non-local) for the first time each client is selected
                     if local_prompts[idx] != []:
-                        # not the first time
-                        if local_gatings[idx] != []:
+                        if local_gatings[idx] != {}: 
                             local_trainer.model.load_state_dict(local_gatings[idx], strict=False)
                         else:
                             local_trainer.model.load_state_dict(global_weights, strict=False)
-                        # experts
-                        # selected_experts = local_trainer.sparse_selection(idx, local_prompts)
-                        # local_trainer.download_nonlocal_ctx([local_prompts[iii] for iii in selected_experts])
-                        if local_prompts[idx] != [] or epoch > 0: # Ensure prompts exist for selection
-                            # Experts selection using Hybrid MMR
+                        
+                        if local_prompts[idx] != [] or epoch > 0: 
                             selected_experts_indices = local_trainer.sparse_selection(idx, local_prompts)
-                            print(f"Client {idx} selected experts: {selected_experts_indices}") # Optional debug print
-                            if selected_experts_indices: # Check if list is not empty
+                            print(f"Client {idx} selected experts: {selected_experts_indices}")
+                            if selected_experts_indices: 
                                 local_trainer.download_nonlocal_ctx([local_prompts[expert_idx] for expert_idx in selected_experts_indices])
-                            else: # Handle case where no experts are selected
-                                local_trainer.download_nonlocal_ctx([]) # Pass empty list
+                            else: 
+                                local_trainer.download_nonlocal_ctx([])
                     else:
-                        # the first time
                         local_trainer.model.load_state_dict(global_weights, strict=False)
-                    local_trainer.model.load_state_dict({"prompt_learner.ctx": global_prompt}, strict=False)
+                    
+                    if global_prompt is not None:
+                        global_prompt_payload = _normalize_ctx_payload(local_trainer.model.prompt_learner, global_prompt)
+                        if global_prompt_payload is not None:
+                            local_trainer.model.load_state_dict({"prompt_learner.ctx": global_prompt_payload['ctx']}, strict=False)
+                        else:
+                            print(f"Warning: Could not normalize and load global_prompt for client {idx}")
+                    elif local_prompts[idx] is not None and local_prompts[idx] != []:
+                        local_prompt_payload = _normalize_ctx_payload(local_trainer.model.prompt_learner, local_prompts[idx])
+                        if local_prompt_payload is not None:
+                            local_trainer.model.load_state_dict({"prompt_learner.ctx": local_prompt_payload['ctx']}, strict=False)
 
                 # train
                 local_trainer.train(idx=idx, global_epoch=epoch, is_fed=True)
 
                 # test selected clients for this round
-                results[idx] = local_trainer.test(idx=idx)
+                # --- CHANGE: Pass new args ---
+                test_output = local_trainer.test(idx=idx, epoch=epoch, output_dir=cfg.OUTPUT_DIR)
+                results[idx] = test_output[:3] # (acc, loss, f1)
+                all_client_preds_lists[idx] = test_output[3] # preds
+                all_client_labels_lists[idx] = test_output[4] # labels
 
                 if results[idx] is not None:
-                    # Assuming results[idx][0] is accuracy percentage
                     current_accuracy = results[idx][0] / 100.0
-                    # Call the new method in PFEDMOAP trainer to update EMA
-                    local_trainer.update_perf_ema(idx, current_accuracy, local_prompts)
 
                 # upload
                 local_weight = local_trainer.model.state_dict()
-                if local_prompts[idx] != []:
+                if 'prompt_learner.ctx' in local_weight:
                     local_gatings[idx] = {name: copy.deepcopy(local_weight[name]) for name in local_weight if 'gating' in name}  # gating dict
-                local_prompts[idx] = copy.deepcopy(local_weight['prompt_learner.ctx'])  # prompts
+                    local_prompts[idx] = copy.deepcopy(local_weight['prompt_learner.ctx'])  # prompts
+                else:
+                    print(f"Warning: 'prompt_learner.ctx' not in local_weight for client {idx}. Skipping upload.")
+
 
             print("------------local train finish epoch:", epoch, "-------------")
             local_trainer.update_lr(["gating"])
@@ -499,10 +649,9 @@ def main(args):
                 if results[idx] is not None:
                     continue
 
-                # --- Start modification ---
-                payload_dict = None # Initialize payload_dict for this client iteration
-
-                if local_gatings[idx] != []: # Client has trained AND has a gating network state
+                payload_dict = None 
+                
+                if local_gatings[idx] != {}: 
                     local_trainer.model.load_state_dict(local_gatings[idx], strict=False)
                     selected_experts = local_trainer.sparse_selection(idx, local_prompts)
                     if selected_experts:
@@ -513,50 +662,130 @@ def main(args):
                     payload = local_prompts[idx]
                     payload_dict = _normalize_ctx_payload(local_trainer.model.prompt_learner, payload)
 
-                    # ===> ADD Check here <===
                     if payload_dict is not None:
                         local_trainer.model.load_ctx(payload_dict['ctx'])
-                        results[idx] = local_trainer.test(idx=idx)
+                        # --- CHANGE: Pass new args ---
+                        test_output = local_trainer.test(idx=idx, epoch=epoch, output_dir=cfg.OUTPUT_DIR)
+                        results[idx] = test_output[:3]
+                        all_client_preds_lists[idx] = test_output[3]
+                        all_client_labels_lists[idx] = test_output[4]
                     else:
                         print(f"Skipping test for trained client {idx}: prompt normalization failed.")
-                        results[idx] = [0.0, 100.0, 0.0] # Assign default bad results
+                        results[idx] = [0.0, 100.0, 0.0, np.array([]), np.array([])]
 
-                elif local_prompts[idx] != []: # Client has trained but might not have gating state
+                elif local_prompts[idx] != []: 
                     payload = local_prompts[idx]
                     payload_dict = _normalize_ctx_payload(local_trainer.model.prompt_learner, payload)
 
-                    # ===> ADD Check here <===
                     if payload_dict is not None:
                         local_trainer.model.load_ctx(payload_dict['ctx'])
                         local_trainer.download_nonlocal_ctx([])
-                        results[idx] = local_trainer.test(idx=idx)
+                        # --- CHANGE: Pass new args ---
+                        test_output = local_trainer.test(idx=idx, epoch=epoch, output_dir=cfg.OUTPUT_DIR)
+                        results[idx] = test_output[:3]
+                        all_client_preds_lists[idx] = test_output[3]
+                        all_client_labels_lists[idx] = test_output[4]
                     else:
                         print(f"Skipping test for trained client {idx}: prompt normalization failed.")
-                        results[idx] = [0.0, 100.0, 0.0] # Assign default bad results
+                        results[idx] = [0.0, 100.0, 0.0, np.array([]), np.array([])]
 
-                else: # Client has NOT trained yet
-                    if global_prompt is not None: # Make sure global_prompt exists
+                else: 
+                    if global_prompt is not None: 
                         payload = global_prompt
-                        # Try to normalize the global prompt
                         payload_dict = _normalize_ctx_payload(local_trainer.model.prompt_learner, payload)
 
-                    # Check if payload_dict is valid (covers None global_prompt AND normalization failure)
                     if payload_dict is not None:
                         local_trainer.model.load_ctx(payload_dict['ctx'])
                         local_trainer.download_nonlocal_ctx([])
-                        # Test ONLY if global_prompt was loaded and normalized correctly
-                        results[idx] = local_trainer.test(idx=idx)
+                        # --- CHANGE: Pass new args ---
+                        test_output = local_trainer.test(idx=idx, epoch=epoch, output_dir=cfg.OUTPUT_DIR)
+                        results[idx] = test_output[:3]
+                        all_client_preds_lists[idx] = test_output[3]
+                        all_client_labels_lists[idx] = test_output[4]
                     else:
-                        # Skip test if global_prompt is None OR if normalization failed
                         print(f"Skipping test for untrained client {idx}: global_prompt unavailable or invalid.")
-                        results[idx] = [0.0, 100.0, 0.0] # Assign default bad results
+                        results[idx] = [0.0, 100.0, 0.0, np.array([]), np.array([])]
 
-                # --- End modification ---
+            
             evaluate_trainer(results, mode=args.model)
+            
+            # --- GLOBAL CM LOGIC (with file saving) ---
+            if epoch % 2 == 0:
+                print(f"\n--- Calculating Global Confusion Matrix at Round: {epoch} ---")
+                global_all_preds = []
+                global_all_labels = []
+                # Use all_users to get predictions from everyone
+                for i in all_users:
+                    if all_client_preds_lists[i] is not None and all_client_labels_lists[i] is not None:
+                        global_all_preds.append(all_client_preds_lists[i])
+                        global_all_labels.append(all_client_labels_lists[i])
+                
+                if global_all_preds:
+                    try:
+                        global_all_preds = np.concatenate(global_all_preds)
+                        global_all_labels = np.concatenate(global_all_labels)
+                        
+                        # --- FIX: Ensure Global CM is 100x100 ---
+                        # Get all class names from dataset to know total count
+                        all_classnames = local_trainer.dm.dataset.classnames
+                        num_classes = len(all_classnames)
+                        all_possible_labels = np.arange(num_classes)
+                        
+                        global_cm = confusion_matrix(global_all_labels, global_all_preds, labels=all_possible_labels)
+                        
+                        # --- NEW: Save Global CM to file ---
+                        try:
+                            cm_dir = os.path.join(cfg.OUTPUT_DIR, 'confusion_matrices', 'global')
+                            os.makedirs(cm_dir, exist_ok=True)
+                            
+                            cm_filename = os.path.join(cm_dir, f'global_cm_round_{epoch}.npy')
+                            np.save(cm_filename, global_cm)
+                            
+                            # Save labels too (though they are just 0..99)
+                            labels_filename = os.path.join(cm_dir, f'global_labels_round_{epoch}.npy')
+                            np.save(labels_filename, np.array(all_classnames))
+
+                            print(f"--- GLOBAL CM (Round {epoch}): Saved to {cm_filename} (Shape: {global_cm.shape}) ---")
+                            print("-------------------------------------")
+                        except Exception as e:
+                            print(f"--- GLOBAL CM (Round {epoch}): FAILED to save. Error: {e} ---")
+                            print("-------------------------------------")
+                        # --- END NEW SAVE LOGIC ---
+                        
+                    except Exception as e:
+                        print(f"Could not compute global confusion matrix: {e}")
+                else:
+                    print("No predictions collected for global confusion matrix.")
+            # --- END GLOBAL CM LOGIC ---
+            
+            # --- NEW: SAVE CHECKPOINT LOGIC ---
+            if cfg.TRAIN.CHECKPOINT_FREQ > 0 and (epoch + 1) % cfg.TRAIN.CHECKPOINT_FREQ == 0:
+                state = {
+                    'epoch': epoch,
+                    'local_prompts': local_prompts,
+                    'local_gatings': local_gatings,
+                    'global_prompt': global_prompt,
+                    'global_test_acc_list': global_test_acc_list,
+                    'global_test_error_list': global_test_error_list,
+                    'global_test_f1_list': global_test_f1_list,
+                    'global_epoch_list': global_epoch_list,
+                    'global_time_list': global_time_list
+                }
+                
+                # Save a round-specific checkpoint
+                save_path = os.path.join(cfg.OUTPUT_DIR, f'checkpoint_round_{epoch}.pth.tar')
+                torch.save(state, save_path)
+                print(f"Saved checkpoint: {save_path}")
+                
+                # Overwrite the 'latest' checkpoint for easy resume
+                latest_path = os.path.join(cfg.OUTPUT_DIR, 'checkpoint_latest.pth.tar')
+                torch.save(state, latest_path)
+                print(f"Updated latest checkpoint: {latest_path}")
+            # --- END NEW LOGIC ---
+
             print("Round on server :", epoch)
 
         elif args.model == "local":
-            # CoOp
             idxs_users = list(range(0, cfg.DATASET.USERS))
             print("idxs_users", idxs_users)
             print("------------local train start epoch:", epoch, "-------------")
@@ -564,24 +793,26 @@ def main(args):
             for idx in idxs_users:
                 local_trainer.model.load_state_dict(global_weights)
                 local_trainer.train(idx=idx, global_epoch=epoch, is_fed=True)
-                results.append(local_trainer.test(idx=idx))
+                # --- CHANGE: Pass new args ---
+                results.append(local_trainer.test(idx=idx, epoch=epoch, output_dir=cfg.OUTPUT_DIR))
             evaluate_trainer(results, mode=args.model)
             break
         
         else:
             raise NotImplementedError(f"Model '{args.model}' is not implemented.")
     
-    for idx in idxs_users:
-        local_trainer.fed_after_train()
-    # global_trainer.fed_after_train()
+    if 'idxs_users' in locals():
+        for idx in idxs_users:
+            local_trainer.fed_after_train()
+    else:
+        print("Skipping final fed_after_train(), idxs_users not defined.")
+
     print("global_test_acc_list:",global_test_acc_list)
-    print("maximum test acc:", max(global_test_acc_list))
-    print("mean of acc:",np.mean(global_test_acc_list[-5:]))
-    print("std of acc:",np.std(global_test_acc_list[-5:]))
+    if global_test_acc_list: 
+        print("maximum test acc:", max(global_test_acc_list))
+        print("mean of acc:",np.mean(global_test_acc_list[-5:]))
+        print("std of acc:",np.std(global_test_acc_list[-5:]))
 
 if __name__ == "__main__":
     args = get_args()
     main(args)
-
-
-
