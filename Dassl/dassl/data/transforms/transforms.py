@@ -19,7 +19,7 @@ AVAI_CHOICES = [
     "instance_norm",
     "random_crop",
     "random_translation",
-    "center_crop",  # This has become a default operation during testing
+    "center_crop",
     "cutout",
     "imagenet_policy",
     "cifar10_policy",
@@ -43,14 +43,6 @@ INTERPOLATION_MODES = {
 class Random2DTranslation:
     """Given an image of (height, width), we resize it to
     (height*1.125, width*1.125), and then perform random cropping.
-
-    Args:
-        height (int): target image height.
-        width (int): target image width.
-        p (float, optional): probability that this operation takes place.
-            Default is 0.5.
-        interpolation (int, optional): desired interpolation. Default is
-            ``torchvision.transforms.functional.InterpolationMode.BILINEAR``
     """
 
     def __init__(
@@ -92,14 +84,7 @@ class Random2DTranslation:
 
 
 class InstanceNormalization:
-    """Normalize data using per-channel mean and standard deviation.
-
-    Reference:
-        - Ulyanov et al. Instance normalization: The missing in- gredient
-          for fast stylization. ArXiv 2016.
-        - Shu et al. A DIRT-T Approach to Unsupervised Domain Adaptation.
-          ICLR 2018.
-    """
+    """Normalize data using per-channel mean and standard deviation."""
 
     def __init__(self, eps=1e-8):
         self.eps = eps
@@ -113,30 +98,13 @@ class InstanceNormalization:
 
 
 class Cutout:
-    """Randomly mask out one or more patches from an image.
-
-    https://github.com/uoguelph-mlrg/Cutout
-
-    Args:
-        n_holes (int, optional): number of patches to cut out
-            of each image. Default is 1.
-        length (int, optinal): length (in pixels) of each square
-            patch. Default is 16.
-    """
+    """Randomly mask out one or more patches from an image."""
 
     def __init__(self, n_holes=1, length=16):
         self.n_holes = n_holes
         self.length = length
 
     def __call__(self, img):
-        """
-        Args:
-            img (Tensor): tensor image of size (C, H, W).
-
-        Returns:
-            Tensor: image with n_holes of dimension
-                length x length cut out of it.
-        """
         h = img.size(1)
         w = img.size(2)
 
@@ -174,15 +142,7 @@ class GaussianNoise:
 
 
 def build_transform(cfg, is_train=True, choices=None):
-    """Build transformation function.
-
-    Args:
-        cfg (CfgNode): config.
-        is_train (bool, optional): for training (True) or test (False).
-            Default is True.
-        choices (list, optional): list of strings which will overwrite
-            cfg.INPUT.TRANSFORMS if given. Default is None.
-    """
+    """Build transformation function."""
     if cfg.INPUT.NO_TRANSFORM:
         print("Note: no transform is applied!")
         return None
@@ -233,12 +193,6 @@ def _build_transform_train(cfg, choices, target_size, normalize):
         print(f"+ random crop (padding = {crop_padding})")
         tfm_train += [RandomCrop(input_size, padding=crop_padding)]
 
-    # if "random_resized_crop" in choices:
-    #     s_ = cfg.INPUT.RRCROP_SCALE
-    #     print(f"+ random resized crop (size={input_size}, scale={s_})")
-    #     tfm_train += [
-    #         RandomResizedCrop(input_size, scale=s_, interpolation=interp_mode)
-    #     ]
     if "random_resized_crop" in choices:
         s_ = cfg.INPUT.RRCROP_SCALE
         print(f"+ random resized crop (size={input_size}, scale={s_})")
@@ -253,7 +207,6 @@ def _build_transform_train(cfg, choices, target_size, normalize):
             tfm_train += [
                 RandomResizedCrop(input_size, scale=s_, interpolation=interp_mode)
             ]
-
 
     if "random_flip" in choices:
         print("+ random flip")
@@ -351,12 +304,15 @@ def _build_transform_test(cfg, choices, target_size, normalize):
     interp_mode = INTERPOLATION_MODES[cfg.INPUT.INTERPOLATION]
     input_size = cfg.INPUT.SIZE
 
+    # === FIX: Use max(input_size) to preserve aspect ratio ===
     print(f"+ resize the smaller edge to {max(input_size)}")
-    # tfm_test += [Resize(max(input_size), interpolation=interp_mode)]
     try:
-        tfm_test += [Resize(input_size, interpolation=interp_mode, antialias=True)]
+        # We use max() to get an integer, forcing resize by shorter edge
+        tfm_test += [Resize(max(input_size), interpolation=interp_mode, antialias=True)]
     except TypeError:
-        tfm_test += [Resize(input_size, interpolation=interp_mode)]
+        # Fallback for older torchvision
+        tfm_test += [Resize(max(input_size), interpolation=interp_mode)]
+    # =========================================================
 
     print(f"+ {target_size} center crop")
     tfm_test += [CenterCrop(input_size)]
@@ -377,4 +333,3 @@ def _build_transform_test(cfg, choices, target_size, normalize):
     tfm_test = Compose(tfm_test)
 
     return tfm_test
-
